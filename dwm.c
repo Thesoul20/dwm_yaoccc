@@ -347,6 +347,13 @@ static void viewtoright(const Arg *arg);
 static void exchange_client(const Arg *arg);
 static void focusdir(const Arg *arg);
 
+/* MRU (Most Recently Used) management functions */
+static void mru_add(Client *c);
+static void mru_remove(Client *c);
+static Client *mru_get_next(void);
+static Client *mru_get_prev(void);
+static void mru_cleanup(void);
+
 static Client *wintoclient(Window w);
 static Monitor *wintomon(Window w);
 static Client *wintosystrayicon(Window w);
@@ -405,6 +412,16 @@ static Window root, wmcheckwin;
 
 static int hiddenWinStackTop = -1;
 static Client *hiddenWinStack[100];
+
+/* MRU (Most Recently Used) window tracking for Alt-Tab */
+typedef struct MRUNode {
+	Client *client;
+	struct MRUNode *next;
+	struct MRUNode *prev;
+} MRUNode;
+
+static MRUNode *mru_list = NULL;
+static MRUNode *mru_current = NULL;
 
 /* configuration, allows nested code to access above variables */
 #include "config.h"
@@ -1345,6 +1362,8 @@ focus(Client *c)
         grabbuttons(c, 1);
         XSetWindowBorder(dpy, c->win, scheme[c->isglobal ? SchemeSelGlobal : SchemeSel][ColBorder].pixel);
         setfocus(c);
+        /* Add to MRU list when window gets focus */
+        mru_add(c);
     } else {
         XSetInputFocus(dpy, root, RevertToPointerRoot, CurrentTime);
         XDeleteProperty(dpy, root, netatom[NetActiveWindow]);
@@ -1381,41 +1400,107 @@ focusmon(const Arg *arg)
 void
 focusstack(const Arg *arg)
 {
-    Client *tempClients[100];
-    Client *c = NULL, *tc = selmon->sel;
-    int last = -1, cur = 0, issingle = issinglewin(NULL);
+    Client *c = NULL;
+    Client *current_focused = selmon->sel;
+    Monitor *m;
+    int issingle = issinglewin(NULL);
 
-    if (!tc)
-        tc = selmon->clients;
-    if (!tc)
+    /* Initialize MRU list if empty */
+    if (!mru_list) {
+        /* Populate MRU list with all existing clients */
+        for (m = mons; m; m = m->next) {
+            for (c = m->clients; c; c = c->next) {
+                if (!HIDDEN(c) && !c->isfullscreen) {
+                    mru_add(c);
+                }
+            }
+        }
+    }
+
+    /* If we have a currently focused window, use it as reference point */
+    if (current_focused) {
+        /* Update MRU position for current focused window */
+        mru_add(current_focused);
+
+        /* Find the next/prev window in MRU order (excluding current) */
+        Client *next_win = NULL;
+        MRUNode *node;
+
+        for (node = mru_list; node; node = node->next) {
+            if (node->client == current_focused) {
+                /* Found current window, get next/prev */
+                if (arg->i == -1) {
+                    /* Previous: wrap to end if needed */
+                    next_win = node->prev ? node->prev->client :
+                              (node->next ? NULL : mru_list->client);
+                    if (!next_win) {
+                        /* Find last node */
+                        MRUNode *last = node;
+                        while (last->next) last = last->next;
+                        next_win = last->client;
+                    }
+                } else {
+                    /* Next: wrap to beginning if needed */
+                    next_win = node->next ? node->next->client : mru_list->client;
+                }
+                break;
+            }
+        }
+
+        c = next_win;
+    } else {
+        /* No current focus, get most recently used window */
+        c = mru_list ? mru_list->client : NULL;
+    }
+
+    if (!c || c == current_focused)
         return;
 
-    for (c = selmon->clients; c; c = c->next) {
-        if (ISVISIBLE(c) && (issingle || !HIDDEN(c))) {
-            last ++;
-            tempClients[last] = c;
-            if (c == tc) cur = last;
+    /* Visual feedback: temporarily highlight the target window */
+    if (c != current_focused) {
+        /* Save original border color */
+        unsigned long orig_border = c->isglobal ?
+            scheme[SchemeSelGlobal][ColBorder].pixel :
+            scheme[SchemeSel][ColBorder].pixel;
+
+        /* Flash border color to indicate selection */
+        XSetWindowBorder(dpy, c->win, scheme[SchemeNorm][ColBorder].pixel);
+        XFlush(dpy);
+        usleep(50000); /* 50ms flash */
+        XSetWindowBorder(dpy, c->win, orig_border);
+        XFlush(dpy);
+    }
+
+    /* Switch to the window's monitor if needed */
+    if (c->mon != selmon) {
+        selmon = c->mon;
+    }
+
+    /* Switch to the window's tag if needed */
+    if (!(c->tags & c->mon->tagset[c->mon->seltags])) {
+        /* Find the first tag that the window belongs to */
+        unsigned int tag;
+        for (tag = 0; tag < LENGTH(tags); tag++) {
+            if (c->tags & (1 << tag)) {
+                view(&(Arg){.ui = 1 << tag});
+                break;
+            }
         }
     }
-    if (last < 0) return;
 
-    if (arg && arg->i == -1) {
-        if (cur - 1 >= 0) c = tempClients[cur - 1];
-        else c = tempClients[last];
-    } else {
-        if (cur + 1 <= last) c = tempClients[cur + 1];
-        else c = tempClients[0];
-    }
+    /* Focus the target window with full visual feedback */
+    focus(c);
 
     if (issingle) {
-        if (c)
-            hideotherwins(&(Arg) { .v = c });
+        hideotherwins(&(Arg) { .v = c });
     } else {
-        if (c) {
-            pointerclient(c);
-            restack(selmon);
-        }
+        restack(c->mon);
+        /* Move cursor to center of focused window for additional visual feedback */
+        pointerclient(c);
     }
+
+    /* Update bars to show new focus */
+    drawbars();
 }
 
 void
@@ -1778,6 +1863,9 @@ manage(Window w, XWindowAttributes *wa)
     if (!HIDDEN(c))
         XMapWindow(dpy, c->win);
     focus(NULL);
+    /* Add new client to MRU list */
+    if (!HIDDEN(c))
+        mru_add(c);
 }
 
 void
@@ -2106,6 +2194,8 @@ propertynotify(XEvent *e)
 void
 quit(const Arg *arg)
 {
+    /* Clean up MRU list before exiting */
+    mru_cleanup();
     running = 0;
 }
 
@@ -2946,6 +3036,8 @@ unmanage(Client *c, int destroyed)
         XSetErrorHandler(xerror);
         XUngrabServer(dpy);
     }
+    /* Remove client from MRU list before freeing */
+    mru_remove(c);
     free(c);
     focus(NULL);
     updateclientlist();
@@ -4145,4 +4237,119 @@ void exchange_client(const Arg *arg) {
   if (!c || c->isfloating || c->isfullscreen)
     return;
   exchange_two_client(c, direction_select(arg));
+}
+
+/* MRU (Most Recently Used) management functions implementation */
+void
+mru_add(Client *c)
+{
+    MRUNode *node;
+
+    if (!c)
+        return;
+
+    /* Check if client is already in MRU list */
+    for (node = mru_list; node; node = node->next) {
+        if (node->client == c) {
+            /* Move to front if already exists */
+            if (node != mru_list) {
+                /* Remove from current position */
+                if (node->prev)
+                    node->prev->next = node->next;
+                if (node->next)
+                    node->next->prev = node->prev;
+                if (mru_current == node)
+                    mru_current = node->prev;
+
+                /* Add to front */
+                node->next = mru_list;
+                node->prev = NULL;
+                mru_list->prev = node;
+                mru_list = node;
+            }
+            return;
+        }
+    }
+
+    /* Create new node */
+    node = ecalloc(1, sizeof(MRUNode));
+    node->client = c;
+    node->next = mru_list;
+    node->prev = NULL;
+
+    if (mru_list)
+        mru_list->prev = node;
+
+    mru_list = node;
+    if (!mru_current)
+        mru_current = node;
+}
+
+void
+mru_remove(Client *c)
+{
+    MRUNode *node;
+
+    for (node = mru_list; node; node = node->next) {
+        if (node->client == c) {
+            if (node->prev)
+                node->prev->next = node->next;
+            else
+                mru_list = node->next;
+
+            if (node->next)
+                node->next->prev = node->prev;
+
+            if (mru_current == node)
+                mru_current = node->prev ? node->prev : node->next;
+
+            free(node);
+            break;
+        }
+    }
+}
+
+Client *
+mru_get_next(void)
+{
+    if (!mru_current || !mru_current->next)
+        return mru_list ? mru_list->client : NULL;
+
+    mru_current = mru_current->next;
+    return mru_current->client;
+}
+
+Client *
+mru_get_prev(void)
+{
+    if (!mru_current)
+        return NULL;
+
+    if (mru_current->prev) {
+        mru_current = mru_current->prev;
+    } else {
+        /* Wrap to end of list */
+        MRUNode *node = mru_current;
+        while (node && node->next)
+            node = node->next;
+        mru_current = node;
+    }
+
+    return mru_current ? mru_current->client : NULL;
+}
+
+void
+mru_cleanup(void)
+{
+    MRUNode *node = mru_list;
+    MRUNode *next;
+
+    while (node) {
+        next = node->next;
+        free(node);
+        node = next;
+    }
+
+    mru_list = NULL;
+    mru_current = NULL;
 }

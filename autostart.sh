@@ -24,7 +24,8 @@ daemons() {
     picom --config ~/.config/picom/picom.conf >> /dev/null 2>&1 & # 开启picom
     xremap ~/.config/xremap/config.yml &	# xremap keyborad
     copyq &     				# copyq manager the clipboard
-    clash-verge &				# clash verge rev 
+    # clash-verge &				# clash verge rev 
+    export WEBKIT_DISABLE_DMABUF_RENDERER=1; clash-verge & #  clash verge rev
 }
 
 cron() {
