@@ -128,8 +128,7 @@ static Key keys[] = {
     /* modifier            key              function          argument */
     { MODKEY,              XK_equal,        togglesystray,    {0} },                     /* super +            |  切换 托盘栏显示状态 */
 
-    { Mod1Mask,             XK_Tab,          focusstack,       {.i = +1} },               /* alt tab            |  全局切换聚焦窗口 */
-    { Mod1Mask|ShiftMask,  XK_Tab,          focusstack,       {.i = -1} },               /* alt shift tab      |  全局反向切换聚焦窗口 */
+    { Mod1Mask,             XK_Tab,          alttab,           {0} },                     /* alt tab            |  现代Alt+Tab窗口切换 */
     { MODKEY,              XK_Tab,          focusstack,       {.i = +1} },               /* super tab          |  全局切换聚焦窗口 */
     { MODKEY|ShiftMask,    XK_Tab,          focusstack,       {.i = -1} },               /* super shift tab    |  全局反向切换聚焦窗口 */
     { MODKEY,              XK_Up,           focusstack,       {.i = -1} },               /* super up           |  本tag内切换聚焦窗口 */

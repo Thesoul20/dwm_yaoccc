@@ -365,6 +365,7 @@ static void zoom(const Arg *arg);
 static void previewallwin();
 static void setpreviewwins(unsigned int n, Monitor *m, unsigned int gappo, unsigned int gappi);
 static void focuspreviewwin(Client *focus_c, Monitor *m);
+static void alttab(const Arg *arg);
 static XImage *getwindowximage(Client *c);
 static XImage *scaledownimage(Client *c, unsigned int cw, unsigned int ch);
 
@@ -3826,6 +3827,184 @@ previewallwin() {
 }
 
 void
+alttab(const Arg *arg) {
+    Monitor *m = selmon;
+    Client *c, *focus_c = NULL;
+    unsigned int n;
+
+    // Count all clients (follow the same pattern as previewallwin)
+    for (n = 0, c = m->clients; c; c = c->next, n++);
+    if (n == 0) return;
+
+    // Set up preview windows (this processes ALL clients)
+    setpreviewwins(n, m, 60, 15);
+
+    // Find the currently focused window
+    for (c = m->clients; c; c = c->next) {
+        if (c == selmon->sel) {
+            focus_c = c;
+            break;
+        }
+    }
+
+    // Start with the currently focused window or first client
+    if (!focus_c) focus_c = m->clients;
+
+    // Safely highlight the initial focus if preview structures are valid
+    if (focus_c && focus_c->preview.win) {
+        XSetWindowBorder(dpy, focus_c->preview.win, scheme[SchemeSel][ColBorder].pixel);
+
+        // Only warp pointer if we have valid scaled image data
+        if (focus_c->preview.scaled_image) {
+            XWarpPointer(dpy, None, root, 0, 0, 0, 0,
+                        focus_c->preview.x + focus_c->preview.scaled_image->width / 2,
+                        focus_c->preview.y + focus_c->preview.scaled_image->height / 2);
+        }
+    }
+
+    // Grab keyboard for exclusive input
+    XGrabKeyboard(dpy, root, True, GrabModeAsync, GrabModeAsync, CurrentTime);
+
+    XEvent event;
+    int cancelled = 0;
+    int alt_released = 0;  // Track if Alt has been released
+
+    while (1) {
+        XNextEvent(dpy, &event);
+
+        if (event.type == KeyPress) {
+            unsigned int state = CLEANMASK(event.xkey.state);
+            KeySym keysym = XKeycodeToKeysym(dpy, event.xkey.keycode, 0);
+
+            // Handle Tab navigation with Alt modifier
+            if (keysym == XK_Tab && state == Mod1Mask) {
+                // Remove border from current focus (safely)
+                if (focus_c && focus_c->preview.win) {
+                    XSetWindowBorder(dpy, focus_c->preview.win, scheme[SchemeNorm][ColBorder].pixel);
+                }
+
+                // Check for Shift to determine direction
+                if (event.xkey.state & ShiftMask) {
+                    // Navigate backward (Alt+Shift+Tab)
+                    Client *prev_c = NULL;
+                    for (c = m->clients; c && c != focus_c; c = c->next) {
+                        prev_c = c;
+                    }
+
+                    // If no previous found, get the last client
+                    if (!prev_c) {
+                        for (c = m->clients; c; c = c->next) {
+                            if (!c->next) prev_c = c;
+                        }
+                    }
+
+                    focus_c = prev_c;
+                } else {
+                    // Navigate forward (Alt+Tab)
+                    if (focus_c && focus_c->next) {
+                        focus_c = focus_c->next;
+                    } else {
+                        focus_c = m->clients;
+                    }
+                }
+
+                // Highlight new focus (safely)
+                if (focus_c && focus_c->preview.win) {
+                    XSetWindowBorder(dpy, focus_c->preview.win, scheme[SchemeSel][ColBorder].pixel);
+
+                    // Only warp if we have valid image data
+                    if (focus_c->preview.scaled_image) {
+                        XWarpPointer(dpy, None, root, 0, 0, 0, 0,
+                                    focus_c->preview.x + focus_c->preview.scaled_image->width / 2,
+                                    focus_c->preview.y + focus_c->preview.scaled_image->height / 2);
+                    }
+                }
+            }
+
+            // Handle Escape to cancel
+            if (keysym == XK_Escape && state == Mod1Mask) {
+                cancelled = 1;
+                break;
+            }
+
+            // Handle Enter to manually confirm selection
+            if (keysym == XK_Return && state == Mod1Mask) {
+                break;
+            }
+        }
+
+        // Handle KeyRelease to detect Alt release
+        if (event.type == KeyRelease) {
+            KeySym keysym = XKeycodeToKeysym(dpy, event.xkey.keycode, 0);
+
+            // Check if Alt key is released
+            if (keysym == XK_Alt_L || keysym == XK_Alt_R) {
+                alt_released = 1;
+                break;  // Alt released - confirm selection
+            }
+        }
+
+        // Mouse click to select (only if we have valid preview windows)
+        if (event.type == ButtonPress && event.xbutton.button == Button1) {
+            for (c = m->clients; c; c = c->next) {
+                if (c->preview.win && event.xbutton.window == c->preview.win) {
+                    focus_c = c;
+                    break;
+                }
+            }
+            if (focus_c) {
+                break;
+            }
+        }
+
+        // Mouse hover to highlight
+        if (event.type == EnterNotify) {
+            for (c = m->clients; c; c = c->next) {
+                if (c->preview.win && event.xcrossing.window == c->preview.win) {
+                    // Remove border from current focus (safely)
+                    if (focus_c && focus_c != c && focus_c->preview.win) {
+                        XSetWindowBorder(dpy, focus_c->preview.win, scheme[SchemeNorm][ColBorder].pixel);
+                    }
+                    focus_c = c;
+                    XSetWindowBorder(dpy, c->preview.win, scheme[SchemeSel][ColBorder].pixel);
+                    break;
+                }
+            }
+        }
+    }
+
+    // Release keyboard grab
+    XUngrabKeyboard(dpy, CurrentTime);
+
+    // Handle the result
+    if (cancelled) {
+        // Clean up preview windows
+        for (c = m->clients; c; c = c->next) {
+            if (c->preview.win) {
+                XUnmapWindow(dpy, c->preview.win);
+                XMapWindow(dpy, c->win);
+            }
+            if (c->preview.scaled_image) XDestroyImage(c->preview.scaled_image);
+        }
+        arrange(m);
+    } else if (focus_c && (alt_released || event.type == ButtonPress ||
+             (event.type == KeyPress && XKeycodeToKeysym(dpy, event.xkey.keycode, 0) == XK_Return))) {
+        // Confirm selection and switch to window's tag
+        focuspreviewwin(focus_c, m);
+    } else {
+        // Fallback cleanup for any other case
+        for (c = m->clients; c; c = c->next) {
+            if (c->preview.win) {
+                XUnmapWindow(dpy, c->preview.win);
+                XMapWindow(dpy, c->win);
+            }
+            if (c->preview.scaled_image) XDestroyImage(c->preview.scaled_image);
+        }
+        arrange(m);
+    }
+}
+
+void
 focuspreviewwin(Client *focus_c, Monitor *m) {
     Client *c;
     for (c = m->clients; c; c = c->next) {
@@ -3840,6 +4019,8 @@ focuspreviewwin(Client *focus_c, Monitor *m) {
         show(focus_c);
         selmon->seltags ^= 1;
         m->tagset[selmon->seltags] = focus_c->tags;
+        arrange(m);     // Reorganize windows after tag switch
+        focus(focus_c); // Actually focus the selected window
     }
 }
 
