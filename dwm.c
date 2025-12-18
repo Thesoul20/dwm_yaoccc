@@ -1661,6 +1661,7 @@ hide(Client *c) {
     XUngrabServer(dpy);
 
     hiddenWinStack[++hiddenWinStackTop] = c;
+    mru_remove(c);  // Remove hidden window from MRU list
     focus(c->snext);
     arrange(c->mon);
 }
@@ -3831,30 +3832,88 @@ alttab(const Arg *arg) {
     Monitor *m = selmon;
     Client *c, *focus_c = NULL;
     unsigned int n;
+    Client *current_focused = selmon->sel;
 
-    // Count all clients (follow the same pattern as previewallwin)
-    for (n = 0, c = m->clients; c; c = c->next, n++);
-    if (n == 0) return;
-
-    // Set up preview windows (this processes ALL clients)
-    setpreviewwins(n, m, 60, 15);
-
-    // Find the currently focused window
-    for (c = m->clients; c; c = c->next) {
-        if (c == selmon->sel) {
-            focus_c = c;
-            break;
+    /* Initialize MRU list if empty (same pattern as focusstack) */
+    if (!mru_list) {
+        /* Populate MRU list with all existing clients */
+        Monitor *mon;
+        for (mon = mons; mon; mon = mon->next) {
+            for (c = mon->clients; c; c = c->next) {
+                if (!HIDDEN(c) && !c->isfullscreen) {
+                    mru_add(c);
+                }
+            }
         }
     }
 
-    // Start with the currently focused window or first client
-    if (!focus_c) focus_c = m->clients;
+    /* Count only visible, non-hidden, non-fullscreen clients for preview setup */
+    for (n = 0, c = m->clients; c; c = c->next) {
+        if (!HIDDEN(c) && !c->isfullscreen) {
+            n++;
+        }
+    }
+    if (n == 0) return;
 
-    // Safely highlight the initial focus if preview structures are valid
+    /* Set up preview windows */
+    setpreviewwins(n, m, 60, 15);
+
+    /* Update MRU position for current focused window (only if visible) */
+    if (current_focused && !HIDDEN(current_focused) && !current_focused->isfullscreen) {
+        mru_add(current_focused);
+    }
+
+    /* Get the next MRU window immediately (skip hidden windows) */
+    if (current_focused && !HIDDEN(current_focused) && !current_focused->isfullscreen) {
+        /* Find the next visible window in MRU order */
+        MRUNode *node;
+        for (node = mru_list; node; node = node->next) {
+            if (node->client == current_focused) {
+                /* Found current window, get next visible */
+                MRUNode *next_node = node->next ? node->next : mru_list;
+                int loop_count = 0; // Prevent infinite loops
+                while (next_node && loop_count < 100) {
+                    if (!HIDDEN(next_node->client) && !next_node->client->isfullscreen) {
+                        focus_c = next_node->client;
+                        break;
+                    }
+                    next_node = next_node->next ? next_node->next : mru_list;
+                    if (next_node == node) break; // Full cycle completed
+                    loop_count++;
+                }
+                break;
+            }
+        }
+    } else {
+        /* No current focus or current is hidden, get most recently used visible window */
+        MRUNode *node = mru_list;
+        int loop_count = 0; // Prevent infinite loops
+        while (node && loop_count < 100) {
+            if (!HIDDEN(node->client) && !node->client->isfullscreen) {
+                focus_c = node->client;
+                break;
+            }
+            node = node->next;
+            if (node == mru_list) break; // Full cycle completed
+            loop_count++;
+        }
+    }
+
+    /* If we couldn't find a next visible window, fallback to first visible client */
+    if (!focus_c) {
+        for (c = m->clients; c; c = c->next) {
+            if (!HIDDEN(c) && !c->isfullscreen) {
+                focus_c = c;
+                break;
+            }
+        }
+    }
+
+    /* Safely highlight the initial focus (now the next MRU window) */
     if (focus_c && focus_c->preview.win) {
         XSetWindowBorder(dpy, focus_c->preview.win, scheme[SchemeSel][ColBorder].pixel);
 
-        // Only warp pointer if we have valid scaled image data
+        /* Only warp pointer if we have valid scaled image data */
         if (focus_c->preview.scaled_image) {
             XWarpPointer(dpy, None, root, 0, 0, 0, 0,
                         focus_c->preview.x + focus_c->preview.scaled_image->width / 2,
@@ -3863,7 +3922,17 @@ alttab(const Arg *arg) {
     }
 
     // Grab keyboard for exclusive input
-    XGrabKeyboard(dpy, root, True, GrabModeAsync, GrabModeAsync, CurrentTime);
+    if (XGrabKeyboard(dpy, root, True, GrabModeAsync, GrabModeAsync, CurrentTime) != GrabSuccess) {
+        // Handle grab failure gracefully - cannot proceed without input control
+        return;
+    }
+
+    // Grab pointer for exclusive mouse input
+    if (XGrabPointer(dpy, root, False, MOUSEMASK, GrabModeAsync, GrabModeAsync,
+                    None, cursor[CurNormal]->cursor, CurrentTime) != GrabSuccess) {
+        XUngrabKeyboard(dpy, CurrentTime);
+        return;
+    }
 
     XEvent event;
     int cancelled = 0;
@@ -3883,29 +3952,34 @@ alttab(const Arg *arg) {
                     XSetWindowBorder(dpy, focus_c->preview.win, scheme[SchemeNorm][ColBorder].pixel);
                 }
 
-                // Check for Shift to determine direction
-                if (event.xkey.state & ShiftMask) {
-                    // Navigate backward (Alt+Shift+Tab)
-                    Client *prev_c = NULL;
-                    for (c = m->clients; c && c != focus_c; c = c->next) {
-                        prev_c = c;
-                    }
+                // Use MRU-based navigation
+                MRUNode *node;
+                Client *next_c = NULL;
 
-                    // If no previous found, get the last client
-                    if (!prev_c) {
-                        for (c = m->clients; c; c = c->next) {
-                            if (!c->next) prev_c = c;
+                /* Find current window in MRU list */
+                for (node = mru_list; node; node = node->next) {
+                    if (node->client == focus_c) {
+                        /* Found current window, get next/prev */
+                        if (event.xkey.state & ShiftMask) {
+                            /* Previous: wrap to end if needed */
+                            next_c = node->prev ? node->prev->client : NULL;
+                            if (!next_c) {
+                                /* Find last node */
+                                MRUNode *last = node;
+                                while (last->next) last = last->next;
+                                next_c = last->client;
+                            }
+                        } else {
+                            /* Next: wrap to beginning if needed */
+                            next_c = node->next ? node->next->client : mru_list->client;
                         }
+                        break;
                     }
+                }
 
-                    focus_c = prev_c;
-                } else {
-                    // Navigate forward (Alt+Tab)
-                    if (focus_c && focus_c->next) {
-                        focus_c = focus_c->next;
-                    } else {
-                        focus_c = m->clients;
-                    }
+                /* Update focus if we found a next window */
+                if (next_c) {
+                    focus_c = next_c;
                 }
 
                 // Highlight new focus (safely)
@@ -3947,7 +4021,8 @@ alttab(const Arg *arg) {
         // Mouse click to select (only if we have valid preview windows)
         if (event.type == ButtonPress && event.xbutton.button == Button1) {
             for (c = m->clients; c; c = c->next) {
-                if (c->preview.win && event.xbutton.window == c->preview.win) {
+                if (c->preview.win && event.xbutton.window == c->preview.win &&
+                    !HIDDEN(c) && !c->isfullscreen) {
                     focus_c = c;
                     break;
                 }
@@ -3960,7 +4035,8 @@ alttab(const Arg *arg) {
         // Mouse hover to highlight
         if (event.type == EnterNotify) {
             for (c = m->clients; c; c = c->next) {
-                if (c->preview.win && event.xcrossing.window == c->preview.win) {
+                if (c->preview.win && event.xcrossing.window == c->preview.win &&
+                    !HIDDEN(c) && !c->isfullscreen) {
                     // Remove border from current focus (safely)
                     if (focus_c && focus_c != c && focus_c->preview.win) {
                         XSetWindowBorder(dpy, focus_c->preview.win, scheme[SchemeNorm][ColBorder].pixel);
@@ -3973,8 +4049,10 @@ alttab(const Arg *arg) {
         }
     }
 
-    // Release keyboard grab
+    // Release both keyboard and pointer grabs
     XUngrabKeyboard(dpy, CurrentTime);
+    XUngrabPointer(dpy, CurrentTime);
+    XSync(dpy, False);  // Ensure all pending requests are processed
 
     // Handle the result
     if (cancelled) {
@@ -4022,6 +4100,10 @@ focuspreviewwin(Client *focus_c, Monitor *m) {
         arrange(m);     // Reorganize windows after tag switch
         focus(focus_c); // Actually focus the selected window
     }
+
+    // Clear any pending pointer events after restoration
+    XEvent dummy_event;
+    while (XCheckMaskEvent(dpy, EnterWindowMask|LeaveWindowMask, &dummy_event));
 }
 
 void
@@ -4046,6 +4128,10 @@ setpreviewwins(unsigned int n, Monitor *m, unsigned int gappo, unsigned int gapp
         cmaxh = 0;
         tmpc = c;
         for (int j = 0; j < cols; j++) {
+            // Skip hidden and fullscreen windows
+            while (c && (HIDDEN(c) || c->isfullscreen)) {
+                c = c->next;
+            }
             if (!c) break;
             c->preview.scaled_image = scaledownimage(c, cw, ch);
             c->preview.x = cx;
@@ -4056,6 +4142,10 @@ setpreviewwins(unsigned int n, Monitor *m, unsigned int gappo, unsigned int gapp
         c = tmpc;
         cx = m->wx + (m->ww - cx) / 2;
         for (j = 0; j < cols; j++) {
+            // Skip hidden and fullscreen windows
+            while (c && (HIDDEN(c) || c->isfullscreen)) {
+                c = c->next;
+            }
             if (!c) break;
             c->preview.x += cx;
             c->preview.y = cy + (cmaxh - c->preview.scaled_image->height) / 2;
@@ -4064,20 +4154,27 @@ setpreviewwins(unsigned int n, Monitor *m, unsigned int gappo, unsigned int gapp
         cy += cmaxh + gappi;
     }
     cy = m->wy + (m->wh - cy) / 2;
-    for (c = m->clients; c; c = c->next)
-        c->preview.y += cy;
+    for (c = m->clients; c; c = c->next) {
+        // Only update y position for visible windows
+        if (!HIDDEN(c) && !c->isfullscreen && c->preview.scaled_image) {
+            c->preview.y += cy;
+        }
+    }
 
 
     for (Client *c = m->clients; c; c = c->next) {
-        if (!c->preview.win) c->preview.win = XCreateSimpleWindow(dpy, root, c->preview.x, c->preview.y, c->preview.scaled_image->width, c->preview.scaled_image->height, 1, BlackPixel(dpy, screen), WhitePixel(dpy, screen));
-        else XMoveResizeWindow(dpy, c->preview.win, c->preview.x, c->preview.y, c->preview.scaled_image->width, c->preview.scaled_image->height);
-        XSetWindowBorder(dpy, c->preview.win, scheme[SchemeNorm][ColBorder].pixel);
-        XUnmapWindow(dpy, c->win);
-        if (c->preview.win) {
-            XSelectInput(dpy, c->preview.win, ButtonPress | EnterWindowMask | LeaveWindowMask);
-            XMapWindow(dpy, c->preview.win);
-            GC gc = XCreateGC(dpy, c->preview.win, 0, NULL);
-            XPutImage(dpy, c->preview.win, gc, c->preview.scaled_image, 0, 0, 0, 0, c->preview.scaled_image->width, c->preview.scaled_image->height);
+        // Only create preview windows for visible windows that have scaled images
+        if (!HIDDEN(c) && !c->isfullscreen && c->preview.scaled_image) {
+            if (!c->preview.win) c->preview.win = XCreateSimpleWindow(dpy, root, c->preview.x, c->preview.y, c->preview.scaled_image->width, c->preview.scaled_image->height, 1, BlackPixel(dpy, screen), WhitePixel(dpy, screen));
+            else XMoveResizeWindow(dpy, c->preview.win, c->preview.x, c->preview.y, c->preview.scaled_image->width, c->preview.scaled_image->height);
+            XSetWindowBorder(dpy, c->preview.win, scheme[SchemeNorm][ColBorder].pixel);
+            XUnmapWindow(dpy, c->win);
+            if (c->preview.win) {
+                XSelectInput(dpy, c->preview.win, ButtonPressMask | ButtonReleaseMask | PointerMotionMask | EnterWindowMask | LeaveWindowMask | FocusChangeMask);
+                XMapWindow(dpy, c->preview.win);
+                GC gc = XCreateGC(dpy, c->preview.win, 0, NULL);
+                XPutImage(dpy, c->preview.win, gc, c->preview.scaled_image, 0, 0, 0, 0, c->preview.scaled_image->width, c->preview.scaled_image->height);
+            }
         }
     }
 }
